@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HMM Stock Predictor</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f3f4f6; }
+        .loader {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #3498db;
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            display: none;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body class="p-8">
+
+    <div class="max-w-4xl mx-auto bg-white rounded-xl shadow-md overflow-hidden p-6">
+        <h1 class="text-2xl font-bold mb-4 text-gray-800">HMM Stock Price Predictor</h1>
+        <p class="text-sm text-gray-600 mb-6">
+            Implements Hidden Markov Models (HMM) based on research by Gupta et al. and Hassan et al. 
+            Uses fractional change features and MAP estimation to forecast trends.
+        </p>
+
+        <div class="flex gap-4 mb-6">
+            <input type="text" id="tickerInput" placeholder="Enter Ticker (e.g., AAPL)" 
+                   class="flex-1 p-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+            <button onclick="runPrediction()" 
+                    class="bg-blue-600 text-white px-6 py-2 rounded hover:bg-blue-700 transition flex items-center gap-2">
+                Predict <div class="loader" id="loader"></div>
+            </button>
+        </div>
+
+        <div id="statusMsg" class="text-sm font-medium text-gray-500 mb-4 h-6"></div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+            <div class="bg-gray-50 p-4 rounded border">
+                <div class="text-gray-500 text-xs uppercase font-bold">Current Price</div>
+                <div class="text-2xl font-bold text-gray-800" id="currentPriceDisplay">--</div>
+            </div>
+            <div class="bg-gray-50 p-4 rounded border">
+                <div class="text-gray-500 text-xs uppercase font-bold">HMM Prediction (Next Day)</div>
+                <div class="text-2xl font-bold" id="predictedPriceDisplay">--</div>
+            </div>
+            <div class="bg-gray-50 p-4 rounded border">
+                <div class="text-gray-500 text-xs uppercase font-bold">Trend Signal</div>
+                <div class="text-2xl font-bold" id="trendSignalDisplay">--</div>
+            </div>
+        </div>
+
+        <div class="relative h-96 w-full">
+            <canvas id="stockChart"></canvas>
+        </div>
+        
+        <div class="mt-6 text-xs text-gray-400">
+            * Methodology: 4-State Discrete HMM trained on fractional daily changes. Features: (Close-Open)/Open, (High-Open)/Open, (Open-Low)/Open. 
+            Uses Viterbi Training and MAP estimation.
+        </div>
+    </div>
+
+<script>
+    // --- Configuration ---
+    const API_KEYS = {
+        AV: 'JQQUUJQRAX8TLXSM',
+        MS: 'adc91e9b5f1decaabf6d74dc20a4416f',
+        FMP: 'zZ5zECyopZEcPtKvkqlb1R52jv2vFusj',
+        FH: 'd22igc9r01qr7ajlkob0d22igc9r01qr7ajlkobg'
+    };
+
+    let chartInstance = null;
+
+    // --- Main Controller ---
+    async function runPrediction() {
+        const ticker = document.getElementById('tickerInput').value.toUpperCase();
+        if (!ticker) return alert('Please enter a ticker symbol.');
+
+        const loader = document.getElementById('loader');
+        const status = document.getElementById('statusMsg');
+        loader.style.display = 'block';
+        status.innerText = 'Initializing data fetch sequence...';
+        
+        // Clear displays
+        document.getElementById('currentPriceDisplay').innerText = '--';
+        document.getElementById('predictedPriceDisplay').innerText = '--';
+        document.getElementById('trendSignalDisplay').innerText = '--';
+        document.getElementById('trendSignalDisplay').className = "text-2xl font-bold";
+
+        try {
+            // 1. Fetch Data (Waterfall Strategy)
+            let rawData = await fetchStockData(ticker, status);
+            if (!rawData || rawData.length < 50) throw new Error("Insufficient data retrieved.");
+
+            status.innerText = `Data retrieved. Training HMM on ${rawData.length} days...`;
+
+            // 2. Preprocess Data
+            // We need Open, High, Low, Close. Calculate Fractional Features.
+            // Features: fracChange, fracHigh, fracLow
+            const features = rawData.map(d => {
+                // Avoid division by zero
+                const open = d.open === 0 ? 0.01 : d.open; 
+                return [
+                    (d.close - d.open) / open,  // fracChange
+                    (d.high - d.open) / open,   // fracHigh
+                    (d.open - d.low) / open     // fracLow
+                ];
+            });
+
+            // 3. Discretize Features (K-Means Clustering)
+            // HMM works best with discrete symbols in JS (easier to implement than GMM)
+            // We cluster the 3D feature vectors into N observation symbols.
+            const N_SYMBOLS = 20; // Number of discrete observation types
+            const N_STATES = 4;   // Hidden market states (Bull, Bear, Stable, Volatile)
+            
+            const { centroids, assignments } = kMeans(features, N_SYMBOLS);
+
+            // 4. Train HMM
+            const hmm = new HMM(N_STATES, N_SYMBOLS);
+            hmm.train(assignments); // Uses Viterbi Training (Hard EM)
+
+            // 5. Predict Next Movement
+            // We find the symbol k that maximizes P(O_next = k | current_state)
+            const lastState = hmm.getLastState(assignments);
+            const predictedSymbolIndex = hmm.predictNextObservation(lastState);
+            const predictedVector = centroids[predictedSymbolIndex]; // [fracChange, fracHigh, fracLow]
+            
+            const lastPrice = rawData[rawData.length - 1].close;
+            const predFracChange = predictedVector[0];
+            const predictedPrice = lastPrice * (1 + predFracChange);
+
+            // 6. Visualization & Output
+            status.innerText = 'Prediction complete.';
+            
+            document.getElementById('currentPriceDisplay').innerText = `$${lastPrice.toFixed(2)}`;
+            document.getElementById('predictedPriceDisplay').innerText = `$${predictedPrice.toFixed(2)}`;
+            
+            const signalElem = document.getElementById('trendSignalDisplay');
+            if (predictedPrice > lastPrice) {
+                signalElem.innerText = "BUY / BULL";
+                signalElem.classList.add("text-green-600");
+            } else {
+                signalElem.innerText = "SELL / BEAR";
+                signalElem.classList.add("text-red-600");
+            }
+
+            renderChart(rawData, predictedPrice);
+
+        } catch (err) {
+            console.error(err);
+            status.innerText = `Error: ${err.message}. Check console for CORS details.`;
+        } finally {
+            loader.style.display = 'none';
+        }
+    }
+
+    // --- Data Fetching Logic (Waterfall) ---
+    async function fetchStockData(ticker, statusDisplay) {
+        let data = null;
+
+        // 1. Alpha Vantage
+        try {
+            statusDisplay.innerText = "Trying AlphaVantage...";
+            const url = `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${ticker}&outputsize=compact&apikey=${API_KEYS.AV}`;
+            const res = await fetch(url);
+            const json = await res.json();
+            if (json['Time Series (Daily)']) {
+                data = parseAV(json['Time Series (Daily)']);
+            }
+        } catch (e) { console.log("AV failed", e); }
+
+        if (data) return data;
+
+        // 2. MarketStack
+        try {
+            statusDisplay.innerText = "Trying MarketStack...";
+            const url = `http://api.marketstack.com/v1/eod?access_key=${API_KEYS.MS}&symbols=${ticker}&limit=100`;
+            // Note: MarketStack free tier is often HTTP only, might fail on HTTPS site due to mixed content
+            const res = await fetch(url);
+            const json = await res.json();
+            if (json.data) {
+                data = json.data.map(d => ({
+                    date: d.date.split('T')[0],
+                    open: d.open, high: d.high, low: d.low, close: d.close
+                })).reverse(); // API returns descending
+            }
+        } catch (e) { console.log("MarketStack failed", e); }
+
+        if (data) return data;
+
+        // 3. FMP
+        try {
+            statusDisplay.innerText = "Trying FMP...";
+            const url = `https://financialmodelingprep.com/api/v3/historical-price-full/${ticker}?timeseries=100&apikey=${API_KEYS.FMP}`;
+            const res = await fetch(url);
+            const json = await res.json();
+            if (json.historical) {
+                data = json.historical.map(d => ({
+                    date: d.date,
+                    open: d.open, high: d.high, low: d.low, close: d.close
+                })).reverse();
+            }
+        } catch (e) { console.log("FMP failed", e); }
+
+        if (data) return data;
+
+        // 4. Finnhub
+        try {
+            statusDisplay.innerText = "Trying Finnhub...";
+            // Finnhub requires timestamps. Get last 3 months.
+            const end = Math.floor(Date.now() / 1000);
+            const start = end - (90 * 24 * 60 * 60);
+            const url = `https://finnhub.io/api/v1/stock/candle?symbol=${ticker}&resolution=D&from=${start}&to=${end}&token=${API_KEYS.FH}`;
+            const res = await fetch(url);
+            const json = await res.json();
+            if (json.s === 'ok') {
+                data = json.t.map((t, i) => ({
+                    date: new Date(t * 1000).toISOString().split('T')[0],
+                    open: json.o[i], high: json.h[i], low: json.l[i], close: json.c[i]
+                }));
+            }
+        } catch (e) { console.log("Finnhub failed", e); }
+
+        return data;
+    }
+
+    function parseAV(timeSeries) {
+        return Object.keys(timeSeries).sort().map(date => {
+            const d = timeSeries[date];
+            return {
+                date: date,
+                open: parseFloat(d['1. open']),
+                high: parseFloat(d['2. high']),
+                low: parseFloat(d['3. low']),
+                close: parseFloat(d['4. close'])
+            };
+        });
+    }
+
+    // --- Math & Algorithms ---
+
+    // K-Means for Discretization
+    function kMeans(data, k) {
+        // Initialize centroids randomly
+        let centroids = data.slice(0, k); 
+        let assignments = new Array(data.length).fill(0);
+        let changed = true;
+        let iter = 0;
+
+        while(changed && iter < 20) {
+            changed = false;
+            // Assignment step
+            for(let i=0; i<data.length; i++) {
+                let minDist = Infinity;
+                let cluster = 0;
+                for(let j=0; j<k; j++) {
+                    const dist = euclidean(data[i], centroids[j]);
+                    if(dist < minDist) {
+                        minDist = dist;
+                        cluster = j;
+                    }
+                }
+                if(assignments[i] !== cluster) {
+                    assignments[i] = cluster;
+                    changed = true;
+                }
+            }
+            // Update step
+            let sums = Array(k).fill(0).map(() => Array(data[0].length).fill(0));
+            let counts = Array(k).fill(0);
+            for(let i=0; i<data.length; i++) {
+                const c = assignments[i];
+                counts[c]++;
+                for(let dim=0; dim<data[0].length; dim++) {
+                    sums[c][dim] += data[i][dim];
+                }
+            }
+            for(let j=0; j<k; j++) {
+                if(counts[j] > 0) {
+                    centroids[j] = sums[j].map(x => x / counts[j]);
+                }
+            }
+            iter++;
+        }
+        return { centroids, assignments };
+    }
+
+    function euclidean(a, b) {
+        return Math.sqrt(a.reduce((sum, val, i) => sum + Math.pow(val - b[i], 2), 0));
+    }
+
+    // --- Hidden Markov Model Class ---
+    class HMM {
+        constructor(numStates, numSymbols) {
+            this.N = numStates;
+            this.M = numSymbols;
+            // Initialize probabilities uniformly + random noise
+            this.A = this.initMatrix(this.N, this.N); // Transition
+            this.B = this.initMatrix(this.N, this.M); // Emission
+            this.Pi = new Array(this.N).fill(1/this.N); // Start probs
+        }
+
+        initMatrix(rows, cols) {
+            let m = [];
+            for(let i=0; i<rows; i++) {
+                let row = [];
+                let sum = 0;
+                for(let j=0; j<cols; j++) {
+                    let val = Math.random();
+                    row.push(val);
+                    sum += val;
+                }
+                m.push(row.map(x => x/sum)); // Normalize
+            }
+            return m;
+        }
+
+        // Simplified Viterbi Training (Hard EM)
+        train(observations) {
+            const T = observations.length;
+            let iter = 0;
+            // Initial Random State Sequence
+            let states = observations.map(() => Math.floor(Math.random() * this.N));
+
+            while(iter < 10) {
+                // 1. Re-estimate A and B based on current states
+                let newA = Array(this.N).fill(0).map(() => Array(this.N).fill(0));
+                let newB = Array(this.N).fill(0).map(() => Array(this.M).fill(0));
+                let stateCounts = Array(this.N).fill(0);
+                let transCounts = Array(this.N).fill(0);
+
+                for(let t=0; t<T-1; t++) {
+                    let from = states[t];
+                    let to = states[t+1];
+                    let obs = observations[t];
+                    
+                    newA[from][to]++;
+                    transCounts[from]++;
+                    
+                    newB[from][obs]++;
+                    stateCounts[from]++;
+                }
+                // Handle last observation
+                newB[states[T-1]][observations[T-1]]++;
+                stateCounts[states[T-1]]++;
+
+                // Normalize
+                for(let i=0; i<this.N; i++) {
+                    for(let j=0; j<this.N; j++) {
+                        this.A[i][j] = (transCounts[i] === 0) ? 1/this.N : newA[i][j] / transCounts[i];
+                    }
+                    for(let k=0; k<this.M; k++) {
+                        this.B[i][k] = (stateCounts[i] === 0) ? 1/this.M : newB[i][k] / stateCounts[i];
+                    }
+                }
+
+                // 2. Decode new most likely state sequence (Viterbi)
+                const newStates = this.viterbi(observations);
+                
+                // Check convergence (simple check: if states don't change much)
+                let changes = 0;
+                for(let t=0; t<T; t++) { if(states[t] !== newStates[t]) changes++; }
+                states = newStates;
+                
+                if(changes === 0) break;
+                iter++;
+            }
+        }
+
+        // Viterbi Algorithm to find most likely state sequence
+        viterbi(obs) {
+            const T = obs.length;
+            let delta = Array(T).fill(0).map(() => Array(this.N).fill(0));
+            let psi = Array(T).fill(0).map(() => Array(this.N).fill(0));
+
+            // Init
+            for(let i=0; i<this.N; i++) {
+                delta[0][i] = Math.log(this.Pi[i]) + Math.log(this.B[i][obs[0]] + 1e-10);
+            }
+
+            // Recursion
+            for(let t=1; t<T; t++) {
+                for(let j=0; j<this.N; j++) {
+                    let maxVal = -Infinity;
+                    let maxState = 0;
+                    for(let i=0; i<this.N; i++) {
+                        let val = delta[t-1][i] + Math.log(this.A[i][j] + 1e-10);
+                        if(val > maxVal) {
+                            maxVal = val;
+                            maxState = i;
+                        }
+                    }
+                    delta[t][j] = maxVal + Math.log(this.B[j][obs[t]] + 1e-10);
+                    psi[t][j] = maxState;
+                }
+            }
+
+            // Backtrack
+            let states = Array(T);
+            let maxVal = -Infinity;
+            for(let i=0; i<this.N; i++) {
+                if(delta[T-1][i] > maxVal) {
+                    maxVal = delta[T-1][i];
+                    states[T-1] = i;
+                }
+            }
+            for(let t=T-2; t>=0; t--) {
+                states[t] = psi[t+1][states[t+1]];
+            }
+            return states;
+        }
+
+        getLastState(obs) {
+            const states = this.viterbi(obs);
+            return states[states.length - 1];
+        }
+
+        // Predict next observation symbol using MAP
+        predictNextObservation(currentState) {
+            let maxProb = -1;
+            let bestSymbol = 0;
+
+            // P(Observation k) = Sum over next states j ( P(State j | State i) * P(Observation k | State j) )
+            for(let k=0; k<this.M; k++) {
+                let prob = 0;
+                for(let j=0; j<this.N; j++) {
+                    prob += this.A[currentState][j] * this.B[j][k];
+                }
+                if(prob > maxProb) {
+                    maxProb = prob;
+                    bestSymbol = k;
+                }
+            }
+            return bestSymbol;
+        }
+    }
+
+    // --- Charting ---
+    function renderChart(historicalData, prediction) {
+        const ctx = document.getElementById('stockChart').getContext('2d');
+        const labels = historicalData.map(d => d.date);
+        const prices = historicalData.map(d => d.close);
+
+        // Add prediction point
+        const lastDate = new Date(labels[labels.length-1]);
+        const nextDate = new Date(lastDate);
+        nextDate.setDate(lastDate.getDate() + 1);
+        
+        labels.push("FORECAST");
+        // We pad the historical line with null for the forecast point
+        const historicalPlot = [...prices, null];
+        // The forecast line connects the last real point to the prediction
+        const forecastPlot = Array(prices.length - 1).fill(null);
+        forecastPlot.push(prices[prices.length - 1]);
+        forecastPlot.push(prediction);
+
+        if (chartInstance) chartInstance.destroy();
+
+        chartInstance = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: labels,
+                datasets: [
+                    {
+                        label: 'Historical Close',
+                        data: historicalPlot,
+                        borderColor: 'rgb(75, 192, 192)',
+                        tension: 0.1
+                    },
+                    {
+                        label: 'HMM Forecast',
+                        data: forecastPlot,
+                        borderColor: 'rgb(255, 99, 132)',
+                        borderDash: [5, 5],
+                        tension: 0.1,
+                        pointRadius: 6
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false
+            }
+        });
+    }
+</script>
+</body>
+</html>
