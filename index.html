@@ -67,6 +67,10 @@
 
 <script>
     // --- Configuration ---
+    // Note: In a real deployment, use the backend proxy. For this static demo, 
+    // we use a public CORS proxy to bypass browser restrictions.
+    const CORS_PROXY = "https://corsproxy.io/?"; 
+    
     const API_KEYS = {
         AV: 'JQQUUJQRAX8TLXSM',
         MS: 'adc91e9b5f1decaabf6d74dc20a4416f',
@@ -85,6 +89,7 @@
         const status = document.getElementById('statusMsg');
         loader.style.display = 'block';
         status.innerText = 'Initializing data fetch sequence...';
+        status.className = "text-sm font-medium text-gray-500 mb-4 h-6"; // Reset color
         
         // Clear displays
         document.getElementById('currentPriceDisplay').innerText = '--';
@@ -95,9 +100,12 @@
         try {
             // 1. Fetch Data (Waterfall Strategy)
             let rawData = await fetchStockData(ticker, status);
-            if (!rawData || rawData.length < 50) throw new Error("Insufficient data retrieved.");
+            
+            // Validation
+            if (!rawData) throw new Error("All API attempts failed.");
+            if (rawData.length < 30) throw new Error(`Insufficient data points (${rawData.length}). Need 30+.`);
 
-            status.innerText = `Data retrieved. Training HMM on ${rawData.length} days...`;
+            status.innerText = `Data retrieved (${rawData.length} points). Training HMM...`;
 
             // 2. Preprocess Data
             // We need Open, High, Low, Close. Calculate Fractional Features.
@@ -152,8 +160,9 @@
             renderChart(rawData, predictedPrice);
 
         } catch (err) {
-            console.error(err);
-            status.innerText = `Error: ${err.message}. Check console for CORS details.`;
+            console.error("Prediction Error:", err);
+            status.innerText = `Error: ${err.message}`;
+            status.className = "text-sm font-medium text-red-500 mb-4 h-6";
         } finally {
             loader.style.display = 'none';
         }
@@ -163,70 +172,80 @@
     async function fetchStockData(ticker, statusDisplay) {
         let data = null;
 
+        // Helper to encode URL for proxy
+        const proxify = (url) => `${CORS_PROXY}${encodeURIComponent(url)}`;
+
         // 1. Alpha Vantage
         try {
-            statusDisplay.innerText = "Trying AlphaVantage...";
+            statusDisplay.innerText = "Attempting AlphaVantage...";
+            // Note: Outputsize=compact returns 100 data points, which is good for speed/rate limits
             const url = `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${ticker}&outputsize=compact&apikey=${API_KEYS.AV}`;
-            const res = await fetch(url);
+            const res = await fetch(proxify(url));
             const json = await res.json();
+            
             if (json['Time Series (Daily)']) {
                 data = parseAV(json['Time Series (Daily)']);
+                console.log("Success with AlphaVantage");
+                return data;
+            } else if (json['Note']) {
+                console.warn("AV Rate Limit:", json['Note']);
             }
-        } catch (e) { console.log("AV failed", e); }
+        } catch (e) { console.warn("AV failed", e); }
 
-        if (data) return data;
-
-        // 2. MarketStack
+        // 2. FMP (Financial Modeling Prep) - Often more reliable for free tier
         try {
-            statusDisplay.innerText = "Trying MarketStack...";
-            const url = `http://api.marketstack.com/v1/eod?access_key=${API_KEYS.MS}&symbols=${ticker}&limit=100`;
-            // Note: MarketStack free tier is often HTTP only, might fail on HTTPS site due to mixed content
-            const res = await fetch(url);
-            const json = await res.json();
-            if (json.data) {
-                data = json.data.map(d => ({
-                    date: d.date.split('T')[0],
-                    open: d.open, high: d.high, low: d.low, close: d.close
-                })).reverse(); // API returns descending
-            }
-        } catch (e) { console.log("MarketStack failed", e); }
-
-        if (data) return data;
-
-        // 3. FMP
-        try {
-            statusDisplay.innerText = "Trying FMP...";
+            statusDisplay.innerText = "Attempting FMP...";
             const url = `https://financialmodelingprep.com/api/v3/historical-price-full/${ticker}?timeseries=100&apikey=${API_KEYS.FMP}`;
-            const res = await fetch(url);
+            const res = await fetch(proxify(url));
             const json = await res.json();
-            if (json.historical) {
+            
+            if (json.historical && json.historical.length > 0) {
                 data = json.historical.map(d => ({
                     date: d.date,
                     open: d.open, high: d.high, low: d.low, close: d.close
                 })).reverse();
+                console.log("Success with FMP");
+                return data;
             }
-        } catch (e) { console.log("FMP failed", e); }
+        } catch (e) { console.warn("FMP failed", e); }
 
-        if (data) return data;
+        // 3. MarketStack
+        try {
+            statusDisplay.innerText = "Attempting MarketStack...";
+            const url = `http://api.marketstack.com/v1/eod?access_key=${API_KEYS.MS}&symbols=${ticker}&limit=100`;
+            const res = await fetch(proxify(url));
+            const json = await res.json();
+            
+            if (json.data && json.data.length > 0) {
+                data = json.data.map(d => ({
+                    date: d.date.split('T')[0],
+                    open: d.open, high: d.high, low: d.low, close: d.close
+                })).reverse();
+                console.log("Success with MarketStack");
+                return data;
+            }
+        } catch (e) { console.warn("MarketStack failed", e); }
 
         // 4. Finnhub
         try {
-            statusDisplay.innerText = "Trying Finnhub...";
-            // Finnhub requires timestamps. Get last 3 months.
+            statusDisplay.innerText = "Attempting Finnhub...";
             const end = Math.floor(Date.now() / 1000);
-            const start = end - (90 * 24 * 60 * 60);
+            const start = end - (120 * 24 * 60 * 60); // 120 days back
             const url = `https://finnhub.io/api/v1/stock/candle?symbol=${ticker}&resolution=D&from=${start}&to=${end}&token=${API_KEYS.FH}`;
-            const res = await fetch(url);
+            const res = await fetch(proxify(url));
             const json = await res.json();
-            if (json.s === 'ok') {
+            
+            if (json.s === 'ok' && json.t && json.t.length > 0) {
                 data = json.t.map((t, i) => ({
                     date: new Date(t * 1000).toISOString().split('T')[0],
                     open: json.o[i], high: json.h[i], low: json.l[i], close: json.c[i]
                 }));
+                console.log("Success with Finnhub");
+                return data;
             }
-        } catch (e) { console.log("Finnhub failed", e); }
+        } catch (e) { console.warn("Finnhub failed", e); }
 
-        return data;
+        return null;
     }
 
     function parseAV(timeSeries) {
