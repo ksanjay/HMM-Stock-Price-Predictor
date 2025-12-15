@@ -69,7 +69,10 @@
     // --- Configuration ---
     // Note: In a real deployment, use the backend proxy. For this static demo, 
     // we use a public CORS proxy to bypass browser restrictions.
-    const CORS_PROXY = "https://corsproxy.io/?"; 
+    const CORS_PROXIES = [
+        "https://corsproxy.io/?",
+        "https://api.allorigins.win/raw?url="
+    ];
     
     const API_KEYS = {
         AV: 'JQQUUJQRAX8TLXSM',
@@ -169,19 +172,28 @@
     }
 
     // --- Data Fetching Logic (Waterfall) ---
+    async function fetchWithRedundancy(url) {
+        for (const proxyBase of CORS_PROXIES) {
+            try {
+                // Ensure we don't double encode if the proxy handles it, but standard is encoded
+                const target = `${proxyBase}${encodeURIComponent(url)}`;
+                const res = await fetch(target);
+                if (res.ok) return await res.json();
+            } catch (e) {
+                console.warn(`Proxy ${proxyBase} failed for ${url}`, e);
+            }
+        }
+        throw new Error("All proxies failed");
+    }
+
     async function fetchStockData(ticker, statusDisplay) {
         let data = null;
-
-        // Helper to encode URL for proxy
-        const proxify = (url) => `${CORS_PROXY}${encodeURIComponent(url)}`;
 
         // 1. Alpha Vantage
         try {
             statusDisplay.innerText = "Attempting AlphaVantage...";
-            // Note: Outputsize=compact returns 100 data points, which is good for speed/rate limits
             const url = `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${ticker}&outputsize=compact&apikey=${API_KEYS.AV}`;
-            const res = await fetch(proxify(url));
-            const json = await res.json();
+            const json = await fetchWithRedundancy(url);
             
             if (json['Time Series (Daily)']) {
                 data = parseAV(json['Time Series (Daily)']);
@@ -192,60 +204,63 @@
             }
         } catch (e) { console.warn("AV failed", e); }
 
-        // 2. FMP (Financial Modeling Prep) - Often more reliable for free tier
-        try {
-            statusDisplay.innerText = "Attempting FMP...";
-            const url = `https://financialmodelingprep.com/api/v3/historical-price-full/${ticker}?timeseries=100&apikey=${API_KEYS.FMP}`;
-            const res = await fetch(proxify(url));
-            const json = await res.json();
-            
-            if (json.historical && json.historical.length > 0) {
-                data = json.historical.map(d => ({
-                    date: d.date,
-                    open: d.open, high: d.high, low: d.low, close: d.close
-                })).reverse();
-                console.log("Success with FMP");
-                return data;
-            }
-        } catch (e) { console.warn("FMP failed", e); }
+        // 2. FMP (Financial Modeling Prep) 
+        if (!data) {
+            try {
+                statusDisplay.innerText = "Attempting FMP...";
+                const url = `https://financialmodelingprep.com/api/v3/historical-price-full/${ticker}?timeseries=100&apikey=${API_KEYS.FMP}`;
+                const json = await fetchWithRedundancy(url);
+                
+                if (json.historical && json.historical.length > 0) {
+                    data = json.historical.map(d => ({
+                        date: d.date,
+                        open: d.open, high: d.high, low: d.low, close: d.close
+                    })).reverse();
+                    console.log("Success with FMP");
+                    return data;
+                }
+            } catch (e) { console.warn("FMP failed", e); }
+        }
 
         // 3. MarketStack
-        try {
-            statusDisplay.innerText = "Attempting MarketStack...";
-            const url = `http://api.marketstack.com/v1/eod?access_key=${API_KEYS.MS}&symbols=${ticker}&limit=100`;
-            const res = await fetch(proxify(url));
-            const json = await res.json();
-            
-            if (json.data && json.data.length > 0) {
-                data = json.data.map(d => ({
-                    date: d.date.split('T')[0],
-                    open: d.open, high: d.high, low: d.low, close: d.close
-                })).reverse();
-                console.log("Success with MarketStack");
-                return data;
-            }
-        } catch (e) { console.warn("MarketStack failed", e); }
+        if (!data) {
+            try {
+                statusDisplay.innerText = "Attempting MarketStack...";
+                const url = `http://api.marketstack.com/v1/eod?access_key=${API_KEYS.MS}&symbols=${ticker}&limit=100`;
+                const json = await fetchWithRedundancy(url);
+                
+                if (json.data && json.data.length > 0) {
+                    data = json.data.map(d => ({
+                        date: d.date.split('T')[0],
+                        open: d.open, high: d.high, low: d.low, close: d.close
+                    })).reverse();
+                    console.log("Success with MarketStack");
+                    return data;
+                }
+            } catch (e) { console.warn("MarketStack failed", e); }
+        }
 
         // 4. Finnhub
-        try {
-            statusDisplay.innerText = "Attempting Finnhub...";
-            const end = Math.floor(Date.now() / 1000);
-            const start = end - (120 * 24 * 60 * 60); // 120 days back
-            const url = `https://finnhub.io/api/v1/stock/candle?symbol=${ticker}&resolution=D&from=${start}&to=${end}&token=${API_KEYS.FH}`;
-            const res = await fetch(proxify(url));
-            const json = await res.json();
-            
-            if (json.s === 'ok' && json.t && json.t.length > 0) {
-                data = json.t.map((t, i) => ({
-                    date: new Date(t * 1000).toISOString().split('T')[0],
-                    open: json.o[i], high: json.h[i], low: json.l[i], close: json.c[i]
-                }));
-                console.log("Success with Finnhub");
-                return data;
-            }
-        } catch (e) { console.warn("Finnhub failed", e); }
+        if (!data) {
+            try {
+                statusDisplay.innerText = "Attempting Finnhub...";
+                const end = Math.floor(Date.now() / 1000);
+                const start = end - (150 * 24 * 60 * 60); 
+                const url = `https://finnhub.io/api/v1/stock/candle?symbol=${ticker}&resolution=D&from=${start}&to=${end}&token=${API_KEYS.FH}`;
+                const json = await fetchWithRedundancy(url);
+                
+                if (json.s === 'ok' && json.t && json.t.length > 0) {
+                    data = json.t.map((t, i) => ({
+                        date: new Date(t * 1000).toISOString().split('T')[0],
+                        open: json.o[i], high: json.h[i], low: json.l[i], close: json.c[i]
+                    }));
+                    console.log("Success with Finnhub");
+                    return data;
+                }
+            } catch (e) { console.warn("Finnhub failed", e); }
+        }
 
-        return null;
+        return data;
     }
 
     function parseAV(timeSeries) {
@@ -507,6 +522,9 @@
             }
         });
     }
+</script>
+</body>
+</html>
 </script>
 </body>
 </html>
